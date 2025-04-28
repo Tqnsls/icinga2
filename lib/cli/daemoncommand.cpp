@@ -222,6 +222,57 @@ static double GetDebugWorkerDelay()
 
 static String l_ObjectsPath;
 
+#ifndef _WIN32
+/**
+ * Checks if one of the given signals is pending.
+ *
+ * @param signal The signals to check
+ * @return A struct containing the signal id and pid of the sender
+ */
+static auto GetPendingSignal(std::initializer_list<int>  signals)
+{
+	struct RetType
+	{
+		int signal = -1;
+		pid_t pid = -1;
+		operator bool(){return signal != -1;}
+	};
+
+	sigset_t sigSet;
+	sigemptyset(&sigSet);
+	for(auto signal : signals){
+		sigaddset(&sigSet, signal);
+	}
+
+	siginfo_t info;
+	timespec ts{.tv_sec = 0, .tv_nsec = 0};
+	int ret = sigtimedwait(&sigSet, &info, &ts);
+
+	if (ret != -1) {
+		return RetType{.signal = ret, .pid = info.si_pid};
+	}
+
+	if (errno == EAGAIN){
+		return RetType{};
+	}
+
+	Log(LogCritical, "Application")
+		<< "Error when waiting for signals in daemoncommand " << strerror(errno);
+	return RetType{};
+}
+
+/**
+ * Checks if the given signal is pending.
+ *
+ * @param signal The signal id of the signal to check
+ * @return A structure containing the signal id and pid of the sending process if it was pending
+ */
+static auto GetPendingSignal(int signal)
+{
+	return GetPendingSignal({signal});
+}
+#endif /* _WIN32 */
+
 /**
  * Do the actual work (config loading, ...)
  *
@@ -274,12 +325,13 @@ int RunWorker(const std::vector<std::string>& configs, bool closeConsoleLog = fa
 			Logger::DisableConsoleLog();
 		}
 
-		while (!l_AllowedToWork.load()) {
+		// The umbrella process will send this signal when the previous worker has shut down.
+		while (!GetPendingSignal(SIGUSR2)) {
 			Utility::Sleep(0.2);
 		}
 
 		Log(LogNotice, "cli")
-			<< "The umbrella process let us continuing";
+			<< "The umbrella process let us continue";
 #endif /* _WIN32 */
 
 		NotifyStatus("Restoring the previous program state...");
@@ -328,104 +380,40 @@ int RunWorker(const std::vector<std::string>& configs, bool closeConsoleLog = fa
 }
 
 #ifndef _WIN32
-// The signals to block temporarily in StartUnixWorker().
-static const sigset_t l_UnixWorkerSignals = ([]() -> sigset_t {
-	sigset_t s;
-
-	(void)sigemptyset(&s);
-	(void)sigaddset(&s, SIGUSR1);
-	(void)sigaddset(&s, SIGUSR2);
-	(void)sigaddset(&s, SIGINT);
-	(void)sigaddset(&s, SIGTERM);
-	(void)sigaddset(&s, SIGHUP);
-
-	return s;
-})();
-
-// The PID of the seamless worker currently being started by StartUnixWorker()
-static Atomic<pid_t> l_CurrentlyStartingUnixWorkerPid (-1);
-
-// The state of the seamless worker currently being started by StartUnixWorker()
-static Atomic<bool> l_CurrentlyStartingUnixWorkerReady (false);
-
-// The last temination signal we received
-static Atomic<int> l_TermSignal (-1);
-
-// Whether someone requested to re-load config (and we didn't handle that request, yet)
-static Atomic<bool> l_RequestedReload (false);
-
-// Whether someone requested to re-open logs (and we didn't handle that request, yet)
-static Atomic<bool> l_RequestedReopenLogs (false);
 
 /**
- * Umbrella process' signal handlers
+ * Block the signals from the given list.
+ *
+ * @param signals A std::initializer_list containing the signals to block
  */
-static void UmbrellaSignalHandler(int num, siginfo_t *info, void*)
-{
-	switch (num) {
-		case SIGUSR1:
-			// Someone requested to re-open logs
-			l_RequestedReopenLogs.store(true);
-			break;
-		case SIGUSR2:
-			if (!l_CurrentlyStartingUnixWorkerReady.load()
-				&& (info->si_pid == 0 || info->si_pid == l_CurrentlyStartingUnixWorkerPid.load()) ) {
-				// The seamless worker currently being started by StartUnixWorker() successfully loaded its config
-				l_CurrentlyStartingUnixWorkerReady.store(true);
-			}
-			break;
-		case SIGINT:
-		case SIGTERM:
-			// Someone requested our termination
+static void BlockUnixSignals(std::initializer_list<int> signals){
+	sigset_t sigSet;
 
-			{
-				struct sigaction sa;
-				memset(&sa, 0, sizeof(sa));
-
-				sa.sa_handler = SIG_DFL;
-
-				(void)sigaction(num, &sa, nullptr);
-			}
-
-			l_TermSignal.store(num);
-			break;
-		case SIGHUP:
-			// Someone requested to re-load config
-			l_RequestedReload.store(true);
-			break;
-		default:
-			// Programming error (or someone has broken the userspace)
-			VERIFY(!"Caught unexpected signal");
+	(void)sigemptyset(&sigSet);
+	for (auto signal : signals) {
+		(void)sigaddset(&sigSet, signal);
 	}
-}
+
+	(void)pthread_sigmask(SIG_BLOCK, &sigSet, nullptr);
+};
 
 /**
- * Seamless worker's signal handlers
+ * Unblocks the signal and sets the handler to the given value.
+ *
+ * @param signal The signal to unblock and reset
+ * @param handler The new handler after unblocking (SIG_DFL if omitted)
  */
-static void WorkerSignalHandler(int num, siginfo_t *info, void*)
+static void UnblockSignalAndSetHandler(int signal, void (*handler)(int) = SIG_DFL)
 {
-	switch (num) {
-		case SIGUSR1:
-			// Catches SIGUSR1 as long as the actual handler (logrotate)
-			// has not been installed not to let SIGUSR1 terminate the process
-			break;
-		case SIGUSR2:
-			if (info->si_pid == 0 || info->si_pid == l_UmbrellaPid) {
-				// The umbrella process allowed us to continue working beyond config validation
-				l_AllowedToWork.store(true);
-			}
-			break;
-		case SIGINT:
-		case SIGTERM:
-			if (info->si_pid == 0 || info->si_pid == l_UmbrellaPid) {
-				// The umbrella process requested our termination
-				Application::RequestShutdown();
-			}
-			break;
-		default:
-			// Programming error (or someone has broken the userspace)
-			VERIFY(!"Caught unexpected signal");
-	}
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = handler;
+	(void)sigaction(signal, &sa, nullptr);
+
+	sigset_t sigSet;
+	(void)sigemptyset(&sigSet);
+	(void)sigaddset(&sigSet, signal);
+	(void)pthread_sigmask(SIG_UNBLOCK, &sigSet, nullptr);
 }
 
 #ifdef HAVE_SYSTEMD
@@ -468,11 +456,6 @@ static pid_t StartUnixWorker(const std::vector<std::string>& configs, bool close
 		exit(EXIT_FAILURE);
 	}
 
-	/* Block the signal handlers we'd like to change in the child process until we changed them.
-	 * Block SIGUSR2 handler until we've set l_CurrentlyStartingUnixWorkerPid.
-	 */
-	(void)sigprocmask(SIG_BLOCK, &l_UnixWorkerSignals, nullptr);
-
 	pid_t pid = fork();
 
 	switch (pid) {
@@ -487,44 +470,15 @@ static pid_t StartUnixWorker(const std::vector<std::string>& configs, bool close
 					<< "Failed to re-initialize thread pool after forking (parent): " << DiagnosticInformation(ex);
 				exit(EXIT_FAILURE);
 			}
-
-			(void)sigprocmask(SIG_UNBLOCK, &l_UnixWorkerSignals, nullptr);
 			return -1;
 
 		case 0:
 			try {
-				{
-					struct sigaction sa;
-					memset(&sa, 0, sizeof(sa));
-
-					sa.sa_handler = SIG_DFL;
-
-					(void)sigaction(SIGUSR1, &sa, nullptr);
-				}
-
-				{
-					struct sigaction sa;
-					memset(&sa, 0, sizeof(sa));
-
-					sa.sa_handler = SIG_IGN;
-
-					(void)sigaction(SIGHUP, &sa, nullptr);
-				}
-
-				{
-					struct sigaction sa;
-					memset(&sa, 0, sizeof(sa));
-
-					sa.sa_sigaction = &WorkerSignalHandler;
-					sa.sa_flags = SA_RESTART | SA_SIGINFO;
-
-					(void)sigaction(SIGUSR1, &sa, nullptr);
-					(void)sigaction(SIGUSR2, &sa, nullptr);
-					(void)sigaction(SIGINT, &sa, nullptr);
-					(void)sigaction(SIGTERM, &sa, nullptr);
-				}
-
-				(void)sigprocmask(SIG_UNBLOCK, &l_UnixWorkerSignals, nullptr);
+				/* We'll leave the other signals blocked since we're going
+				 * to handle them synchronously with sigtimedwait in
+				 * Application::RunEventLoop().
+				 */
+				UnblockSignalAndSetHandler(SIGHUP, SIG_IGN);
 
 				try {
 					Application::InitializeBase();
@@ -551,9 +505,6 @@ static pid_t StartUnixWorker(const std::vector<std::string>& configs, bool close
 			}
 
 		default:
-			l_CurrentlyStartingUnixWorkerPid.store(pid);
-			(void)sigprocmask(SIG_UNBLOCK, &l_UnixWorkerSignals, nullptr);
-
 			Log(LogNotice, "cli")
 				<< "Spawned worker process (PID " << pid << "), waiting for it to load its config";
 
@@ -571,18 +522,15 @@ static pid_t StartUnixWorker(const std::vector<std::string>& configs, bool close
 					break;
 				}
 
-				if (l_CurrentlyStartingUnixWorkerReady.load()) {
-					Log(LogNotice, "cli")
+				auto sig = GetPendingSignal(SIGUSR2);
+				if (sig && (sig.pid == 0 || sig.pid == pid)) {
+					Log(LogNotice, "Application")
 						<< "Worker process successfully loaded its config";
 					break;
 				}
 
 				Utility::Sleep(0.2);
 			}
-
-			// Reset flags for the next time
-			l_CurrentlyStartingUnixWorkerPid.store(-1);
-			l_CurrentlyStartingUnixWorkerReady.store(false);
 
 			try {
 				Application::InitializeBase();
@@ -619,6 +567,13 @@ int DaemonCommand::Run(const po::variables_map& vm, const std::vector<std::strin
 #ifdef _WIN32
 	SetConsoleOutputCP(65001);
 #endif /* _WIN32 */
+
+#ifndef _WIN32
+	/* Block the signals we'd like receive synchronously via sigtimedwait.
+	 * On the worker side we'll unblock SIGHUP after fork().
+	 */
+	BlockUnixSignals({SIGUSR1, SIGUSR2, SIGTERM, SIGINT, SIGHUP});
+#endif
 
 	Logger::EnableTimestamp();
 
@@ -722,20 +677,6 @@ int DaemonCommand::Run(const po::variables_map& vm, const std::vector<std::strin
 	l_UmbrellaPid = getpid();
 	Application::SetUmbrellaProcess(l_UmbrellaPid);
 
-	{
-		struct sigaction sa;
-		memset(&sa, 0, sizeof(sa));
-
-		sa.sa_sigaction = &UmbrellaSignalHandler;
-		sa.sa_flags = SA_NOCLDSTOP | SA_RESTART | SA_SIGINFO;
-
-		(void)sigaction(SIGUSR1, &sa, nullptr);
-		(void)sigaction(SIGUSR2, &sa, nullptr);
-		(void)sigaction(SIGINT, &sa, nullptr);
-		(void)sigaction(SIGTERM, &sa, nullptr);
-		(void)sigaction(SIGHUP, &sa, nullptr);
-	}
-
 	bool closeConsoleLog = !vm.count("daemonize") && vm.count("close-stdio");
 
 	String errorLog;
@@ -777,12 +718,16 @@ int DaemonCommand::Run(const po::variables_map& vm, const std::vector<std::strin
 #endif /* HAVE_SYSTEMD */
 
 		if (!requestedTermination) {
-			int termSig = l_TermSignal.load();
-			if (termSig != -1) {
-				Log(LogNotice, "cli")
-					<< "Got signal " << termSig << ", forwarding to seamless worker (PID " << currentWorker << ")";
+			auto sig = GetPendingSignal(SIGTERM);
+			if (!sig) {
+				sig = GetPendingSignal(SIGINT);
+			}
+			if (sig) {
+				UnblockSignalAndSetHandler(sig.signal, SIG_DFL);
+				Log(LogCritical, "cli")
+					<< "Got signal " << sig.signal << ", forwarding to seamless worker (PID " << currentWorker << ")";
 
-				(void)kill(currentWorker, termSig);
+				(void)kill(currentWorker, sig.signal);
 				requestedTermination = true;
 
 #ifdef HAVE_SYSTEMD
@@ -794,7 +739,7 @@ int DaemonCommand::Run(const po::variables_map& vm, const std::vector<std::strin
 			}
 		}
 
-		if (l_RequestedReload.exchange(false)) {
+		if (GetPendingSignal(SIGHUP)) {
 			Log(LogInformation, "Application")
 				<< "Got reload command: Starting new instance.";
 
@@ -851,7 +796,7 @@ int DaemonCommand::Run(const po::variables_map& vm, const std::vector<std::strin
 
 		}
 
-		if (l_RequestedReopenLogs.exchange(false)) {
+		if (GetPendingSignal(SIGUSR1)) {
 			Log(LogNotice, "cli")
 				<< "Got signal " << SIGUSR1 << ", forwarding to seamless worker (PID " << currentWorker << ")";
 

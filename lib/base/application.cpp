@@ -301,6 +301,66 @@ void Application::SetArgV(char **argv)
 }
 
 /**
+ * Seamless worker's signal handlers
+ */
+void Application::WorkerSignalHandler(double timeout)
+{
+	sigset_t sigSet;
+	sigemptyset (&sigSet);
+	sigaddset(&sigSet, SIGUSR1);
+	sigaddset(&sigSet, SIGUSR2);
+	sigaddset(&sigSet, SIGTERM);
+	sigaddset(&sigSet, SIGINT);
+
+	siginfo_t sigInfo;
+	timespec ts{.tv_sec = (int)timeout, .tv_nsec = (int)(timeout*1000000000) % 1000000000};
+	int signal = sigtimedwait(&sigSet, &sigInfo, &ts);
+	if (signal == -1){
+		if (errno == EAGAIN) {
+			return;
+		} else {
+			Log(LogCritical, "Application")
+				<< "Error when waiting for signals in application " << strerror(errno);
+			return;
+		}
+	}
+
+	Log(LogInformation, "Application")
+		<< "Received signal " << strsignal(signal);
+
+	switch (signal) {
+		case SIGUSR1:
+			if (sigInfo.si_pid == 0 || sigInfo.si_pid == getppid()) {
+				Log(LogInformation, "Application")
+					<< "Received USR1 signal, reopening application logs.";
+
+				RequestReopenLogs();
+			} else {
+				Log(LogWarning, "Application")
+					<< "Received USR1 from unknown pid: " << sigInfo.si_pid;
+			}
+			break;
+		case SIGUSR2:
+			Log(LogWarning, "Application")
+				<< "Received superfluous USR2";
+			break;
+		case SIGINT:
+		case SIGTERM:
+			if (sigInfo.si_pid == 0 || sigInfo.si_pid == getppid()) {
+				// The umbrella process requested our termination
+				RequestShutdown();
+			} else {
+				Log(LogCritical, "Application")
+					<< "Received " << strsignal(signal) << " from unknown pid: " << sigInfo.si_pid;
+			}
+			break;
+		default:
+			// Programming error (or someone has broken the userspace)
+			VERIFY(!"Caught unexpected signal");
+	}
+}
+
+/**
  * Processes events for registered sockets and timers and calls whatever
  * handlers have been set up for these events.
  */
@@ -325,9 +385,6 @@ void Application::RunEventLoop()
 			(void)kill(m_UmbrellaProcess, SIGHUP);
 #endif /* _WIN32 */
 		} else {
-			/* Watches for changes to the system time. Adjusts timers if necessary. */
-			Utility::Sleep(2.5);
-
 			if (m_RequestReopenLogs) {
 				Log(LogNotice, "Application", "Reopening log files");
 				m_RequestReopenLogs = false;
@@ -337,6 +394,7 @@ void Application::RunEventLoop()
 			double now = Utility::GetTime();
 			double timeDiff = lastLoop - now;
 
+			// Watches for changes to the system time. Adjusts timers if necessary.
 			if (std::fabs(timeDiff) > 15) {
 				/* We made a significant jump in time. */
 				Log(LogInformation, "Application")
@@ -349,6 +407,11 @@ void Application::RunEventLoop()
 
 			lastLoop = now;
 		}
+#ifndef _WIN32
+		WorkerSignalHandler(0.2);
+#else
+		Utility::Sleep(0.2);
+#endif /* _WIN32 */
 	}
 
 	Log(LogInformation, "Application", "Shutting down...");
@@ -707,20 +770,6 @@ void Application::AttachDebugger(const String& filename, bool interactive)
 }
 
 /**
- * Signal handler for SIGUSR1. This signal causes Icinga to re-open
- * its log files and is mainly for use by logrotate.
- *
- * @param - The signal number.
- */
-void Application::SigUsr1Handler(int)
-{
-	Log(LogInformation, "Application")
-		<< "Received USR1 signal, reopening application logs.";
-
-	RequestReopenLogs();
-}
-
-/**
  * Signal handler for SIGABRT. Helps with debugging ASSERT()s.
  *
  * @param - The signal number.
@@ -995,13 +1044,7 @@ void Application::InstallExceptionHandlers()
  */
 int Application::Run()
 {
-#ifndef _WIN32
-	struct sigaction sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = &Application::SigUsr1Handler;
-	sa.sa_flags = SA_RESTART;
-	sigaction(SIGUSR1, &sa, nullptr);
-#else /* _WIN32 */
+#ifdef _WIN32
 	SetConsoleCtrlHandler(&Application::CtrlHandler, TRUE);
 #endif /* _WIN32 */
 

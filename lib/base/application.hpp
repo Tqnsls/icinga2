@@ -157,8 +157,8 @@ private:
 	static void DisplayBugMessage(std::ostream& os);
 
 	static void SigAbrtHandler(int signum);
-	static void SigUsr1Handler(int signum);
 	static void ExceptionHandler();
+	static void WorkerSignalHandler(double timeout);
 
 	static String GetCrashReportFilename();
 
